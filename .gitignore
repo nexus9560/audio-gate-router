@@ -1,0 +1,9 @@
+# Build artifacts
+audio_gate_router
+app_icon_data.h
+*.o
+
+# Editor / OS noise
+*.swp
+*~
+.DS_Store
