@@ -20,6 +20,7 @@
 #define CHANNELS 2
 #define CHUNK_FRAMES 256   // ~5.3ms chunks for instant gate detection
 #define HOLD_TIME_MS 600   // Hold direct link open for 600ms after noise stops
+#define UI_UPDATE_INTERVAL_MS 100 // Throttle UI label redraws to 10Hz max
 #define CONFIG_SYNC_INTERVAL_SEC 3600 // Diff and sync every 1 hour (3600s)
 
 typedef struct {
@@ -32,7 +33,24 @@ typedef struct {
     GPtrArray *sinks;
 } DeviceList;
 
+struct RouteEntry;
+
+/* Atomically reference-counted context shared safely between GTK & worker thread */
 typedef struct {
+    struct RouteEntry *owner_entry; // Accessed only on GTK main thread
+    volatile gint running;
+    volatile gint active_gate;
+    volatile gint ui_update_pending;
+    volatile double current_db;
+    volatile double threshold_db;
+
+    char *source_name;
+    char *source_port;
+    char *sink_name;
+    char *sink_port;
+} WorkerContext;
+
+typedef struct RouteEntry {
     GtkWidget *row_box;
     GtkWidget *input_dd;
     GtkWidget *in_port_dd;
@@ -45,16 +63,7 @@ typedef struct {
     GPtrArray *in_ports;
     GPtrArray *out_ports;
 
-    pthread_t thread;
-    volatile bool running;
-    volatile bool active_gate;
-    volatile double current_db;
-
-    char *source_name;
-    char *source_port;
-    char *sink_name;
-    char *sink_port;
-    double threshold_db;
+    WorkerContext *active_worker;
 } RouteEntry;
 
 static GtkWidget *main_window = NULL;
@@ -117,6 +126,7 @@ static const gchar sni_introspection_xml[] =
     "    </signal>"
     "  </interface>"
     "</node>";
+
 static const gchar dbusmenu_introspection_xml[] =
     "<node>"
     "  <interface name='com.canonical.dbusmenu'>"
@@ -180,7 +190,6 @@ static GVariant *sni_get_property(GDBusConnection *conn, const gchar *sender, co
         g_free(dir);
         return v;
     }
-    // Returning "" for IconName forces KDE Plasma to use IconPixmap directly from memory
     if (g_strcmp0(prop, "IconName") == 0) return g_variant_new_string("");
     if (g_strcmp0(prop, "IconPixmap") == 0) return build_sni_icon_pixmap_variant();
     if (g_strcmp0(prop, "OverlayIconName") == 0) return g_variant_new_string("");
@@ -339,6 +348,7 @@ static void update_autostart_desktop_file(bool enable) {
                  "Comment=Noise-Gated PipeWire Direct Patchbay\n"
                  "Exec=\"%s\"\n"
                  "Icon=" APP_ICON_NAME "\n"
+                 "StartupWMClass=" APP_ICON_NAME "\n"
                  "Terminal=false\n"
                  "Categories=AudioVideo;Audio;\n"
                  "X-GNOME-Autostart-enabled=true\n",
@@ -589,25 +599,25 @@ static void link_port_pair(const char *out_port, const char *in_port, bool conne
                  NULL, NULL, NULL, NULL, NULL, NULL);
 }
 
-static void set_pipewire_direct_link(RouteEntry *entry, bool connect) {
-    if (!entry || !entry->source_name || !entry->sink_name || !entry->source_port || !entry->sink_port) {
+static void set_pipewire_direct_link(WorkerContext *wctx, bool connect) {
+    if (!wctx || !wctx->source_name || !wctx->sink_name || !wctx->source_port || !wctx->sink_port) {
         return;
     }
 
-    bool src_stereo = (g_strcmp0(entry->source_port, "Stereo (FL + FR)") == 0);
-    bool snk_stereo = (g_strcmp0(entry->sink_port, "Stereo (FL + FR)") == 0);
+    bool src_stereo = (g_strcmp0(wctx->source_port, "Stereo (FL + FR)") == 0);
+    bool snk_stereo = (g_strcmp0(wctx->sink_port, "Stereo (FL + FR)") == 0);
 
     char src_fl[512], src_fr[512], src_mono[512], src_single[512];
     char snk_fl[512], snk_fr[512], snk_single[512];
 
-    snprintf(src_fl, sizeof(src_fl), "%s:capture_FL", entry->source_name);
-    snprintf(src_fr, sizeof(src_fr), "%s:capture_FR", entry->source_name);
-    snprintf(src_mono, sizeof(src_mono), "%s:capture_MONO", entry->source_name);
-    snprintf(src_single, sizeof(src_single), "%s:%s", entry->source_name, entry->source_port);
+    snprintf(src_fl, sizeof(src_fl), "%s:capture_FL", wctx->source_name);
+    snprintf(src_fr, sizeof(src_fr), "%s:capture_FR", wctx->source_name);
+    snprintf(src_mono, sizeof(src_mono), "%s:capture_MONO", wctx->source_name);
+    snprintf(src_single, sizeof(src_single), "%s:%s", wctx->source_name, wctx->source_port);
 
-    snprintf(snk_fl, sizeof(snk_fl), "%s:playback_FL", entry->sink_name);
-    snprintf(snk_fr, sizeof(snk_fr), "%s:playback_FR", entry->sink_name);
-    snprintf(snk_single, sizeof(snk_single), "%s:%s", entry->sink_name, entry->sink_port);
+    snprintf(snk_fl, sizeof(snk_fl), "%s:playback_FL", wctx->sink_name);
+    snprintf(snk_fr, sizeof(snk_fr), "%s:playback_FR", wctx->sink_name);
+    snprintf(snk_single, sizeof(snk_single), "%s:%s", wctx->sink_name, wctx->sink_port);
 
     if (src_stereo && snk_stereo) {
         link_port_pair(src_fl, snk_fl, connect);
@@ -681,26 +691,65 @@ cleanup:
     pa_mainloop_free(ml);
 }
 
+/* Destructor called by g_atomic_rc_box_release_full ONLY when refcount hits 0 */
+static void worker_context_clear(gpointer data) {
+    WorkerContext *wctx = (WorkerContext *)data;
+    g_free(wctx->source_name);
+    g_free(wctx->source_port);
+    g_free(wctx->sink_name);
+    g_free(wctx->sink_port);
+}
+
+static void worker_context_unref(gpointer data) {
+    if (data) {
+        g_atomic_rc_box_release_full(data, worker_context_clear);
+    }
+}
+
+/* Safe, throttled UI callback on GTK Main Thread */
 static gboolean update_row_ui(gpointer user_data) {
+    WorkerContext *wctx = (WorkerContext *)user_data;
+    g_atomic_int_set(&wctx->ui_update_pending, 0);
+
     if (shutting_down) return G_SOURCE_REMOVE;
-    RouteEntry *entry = (RouteEntry *)user_data;
-    if (!entry->running) {
+
+    RouteEntry *entry = wctx->owner_entry;
+    if (!entry || entry->active_worker != wctx) {
+        return G_SOURCE_REMOVE;
+    }
+
+    if (!g_atomic_int_get(&wctx->running)) {
         gtk_label_set_markup(GTK_LABEL(entry->status_label), "<span foreground='gray'>Stopped</span>");
         return G_SOURCE_REMOVE;
     }
 
+    if (main_window && !gtk_widget_get_visible(main_window)) {
+        return G_SOURCE_REMOVE;
+    }
+
     char buf[128];
-    if (entry->active_gate) {
-        snprintf(buf, sizeof(buf), "<span foreground='#2ec27e' weight='bold'>LINKED (%.1f dB)</span>", entry->current_db);
+    if (g_atomic_int_get(&wctx->active_gate)) {
+        snprintf(buf, sizeof(buf), "<span foreground='#2ec27e' weight='bold'>LINKED (%.1f dB)</span>", wctx->current_db);
     } else {
-        snprintf(buf, sizeof(buf), "<span foreground='#e01b24'>Unlinked (%.1f dB)</span>", entry->current_db);
+        snprintf(buf, sizeof(buf), "<span foreground='#e01b24'>Unlinked (%.1f dB)</span>", wctx->current_db);
     }
     gtk_label_set_markup(GTK_LABEL(entry->status_label), buf);
     return G_SOURCE_REMOVE;
 }
 
+static void schedule_ui_update(WorkerContext *wctx) {
+    if (g_atomic_int_compare_and_exchange(&wctx->ui_update_pending, 0, 1)) {
+        // Acquire a reference for the idle callback; automatically released via worker_context_unref
+        g_idle_add_full(G_PRIORITY_DEFAULT_IDLE,
+                        update_row_ui,
+                        g_atomic_rc_box_acquire(wctx),
+                        worker_context_unref);
+    }
+}
+
+/* Detached worker thread with atomic reference counting */
 static void *route_worker(void *arg) {
-    RouteEntry *entry = (RouteEntry *)arg;
+    WorkerContext *wctx = (WorkerContext *)arg;
     static const pa_sample_spec ss = {
         .format = PA_SAMPLE_S16LE,
         .rate = SAMPLE_RATE,
@@ -715,93 +764,103 @@ static void *route_worker(void *arg) {
         .fragsize  = CHUNK_FRAMES * CHANNELS * sizeof(int16_t)
     };
 
-    int error;
-    pa_simple *in_stream = pa_simple_new(
-        NULL, "AudioGateDetector", PA_STREAM_RECORD, entry->source_name,
-        "Level Trigger", &ss, NULL, &buf_attr, &error
-    );
-
-    if (!in_stream) {
-        entry->running = false;
-        g_idle_add(update_row_ui, entry);
-        return NULL;
-    }
-
     int16_t buffer[CHUNK_FRAMES * CHANNELS];
     gint64 last_active_time = 0;
+    gint64 last_ui_time = 0;
     bool is_linked = false;
 
-    set_pipewire_direct_link(entry, false);
+    set_pipewire_direct_link(wctx, false);
 
-    while (entry->running) {
-        if (pa_simple_read(in_stream, buffer, sizeof(buffer), &error) < 0) {
-            break;
+    while (g_atomic_int_get(&wctx->running)) {
+        int error = 0;
+        pa_simple *in_stream = pa_simple_new(
+            NULL, "AudioGateDetector", PA_STREAM_RECORD, wctx->source_name,
+            "Level Trigger", &ss, NULL, &buf_attr, &error
+        );
+
+        if (!in_stream) {
+            for (int i = 0; i < 10 && g_atomic_int_get(&wctx->running); i++) {
+                g_usleep(100000);
+            }
+            continue;
         }
 
-        double sum = 0.0;
-        int total_samples = CHUNK_FRAMES * CHANNELS;
-        for (int i = 0; i < total_samples; i++) {
-            double norm = buffer[i] / 32768.0;
-            sum += norm * norm;
+        while (g_atomic_int_get(&wctx->running)) {
+            if (pa_simple_read(in_stream, buffer, sizeof(buffer), &error) < 0) {
+                break;
+            }
+
+            if (!g_atomic_int_get(&wctx->running)) break;
+
+            double sum = 0.0;
+            int total_samples = CHUNK_FRAMES * CHANNELS;
+            for (int i = 0; i < total_samples; i++) {
+                double norm = buffer[i] / 32768.0;
+                sum += norm * norm;
+            }
+            double rms = sqrt(sum / total_samples);
+            double db = (rms > 0.000001) ? 20.0 * log10(rms) : -90.0;
+            wctx->current_db = db;
+
+            gint64 now = g_get_monotonic_time() / 1000;
+            if (db >= wctx->threshold_db) {
+                last_active_time = now;
+            }
+
+            bool should_wire = (now - last_active_time) <= HOLD_TIME_MS;
+            bool state_changed = false;
+
+            if (should_wire && !is_linked) {
+                set_pipewire_direct_link(wctx, true);
+                is_linked = true;
+                g_atomic_int_set(&wctx->active_gate, 1);
+                state_changed = true;
+            } else if (!should_wire && is_linked) {
+                set_pipewire_direct_link(wctx, false);
+                is_linked = false;
+                g_atomic_int_set(&wctx->active_gate, 0);
+                state_changed = true;
+            }
+
+            if (state_changed || (now - last_ui_time) >= UI_UPDATE_INTERVAL_MS) {
+                last_ui_time = now;
+                schedule_ui_update(wctx);
+            }
         }
-        double rms = sqrt(sum / total_samples);
-        double db = (rms > 0.000001) ? 20.0 * log10(rms) : -90.0;
-        entry->current_db = db;
 
-        gint64 now = g_get_monotonic_time() / 1000;
-        if (db >= entry->threshold_db) {
-            last_active_time = now;
-        }
-
-        bool should_wire = (now - last_active_time) <= HOLD_TIME_MS;
-
-        if (should_wire && !is_linked) {
-            set_pipewire_direct_link(entry, true);
-            is_linked = true;
-            entry->active_gate = true;
-        } else if (!should_wire && is_linked) {
-            set_pipewire_direct_link(entry, false);
-            is_linked = false;
-            entry->active_gate = false;
-        }
-
-        g_idle_add(update_row_ui, entry);
+        pa_simple_free(in_stream);
     }
 
-    // Always unlink when worker thread exits
-    set_pipewire_direct_link(entry, false);
-    pa_simple_free(in_stream);
-    entry->active_gate = false;
-    g_idle_add(update_row_ui, entry);
+    set_pipewire_direct_link(wctx, false);
+    // Release the worker thread's own reference to wctx
+    worker_context_unref(wctx);
     return NULL;
 }
 
-/* --- GUI Callbacks & Cleanup Helpers --- */
+/* --- GUI Callbacks & Non-Blocking Cleanup Helpers --- */
 static void stop_entry(RouteEntry *entry) {
-    if (entry->running) {
-        entry->running = false;
-        pthread_join(entry->thread, NULL);
+    if (!entry || !entry->active_worker) return;
+
+    WorkerContext *wctx = entry->active_worker;
+    entry->active_worker = NULL;
+
+    wctx->owner_entry = NULL;
+    g_atomic_int_set(&wctx->running, 0);
+
+    set_pipewire_direct_link(wctx, false);
+
+    if (!shutting_down && entry->status_label) {
+        gtk_label_set_markup(GTK_LABEL(entry->status_label), "<span foreground='gray'>Stopped</span>");
     }
-    // Explicitly guarantee PipeWire ports are unlinked even if worker exited early
-    if (entry->source_name && entry->sink_name) {
-        set_pipewire_direct_link(entry, false);
-    }
-    g_free(entry->source_name);
-    g_free(entry->source_port);
-    g_free(entry->sink_name);
-    g_free(entry->sink_port);
-    entry->source_name = NULL;
-    entry->source_port = NULL;
-    entry->sink_name = NULL;
-    entry->sink_port = NULL;
+
+    // Release the GUI row's reference to wctx
+    worker_context_unref(wctx);
 }
 
-/* Saves current state to config and unlinks all active routes before exit */
 static void perform_clean_shutdown(void) {
     if (shutting_down) return;
     shutting_down = true;
 
-    // Save config BEFORE stopping entries so active=true states are preserved for next launch
     sync_config_if_diff(false);
 
     if (route_entries) {
@@ -859,13 +918,17 @@ static void on_output_node_changed(GObject *object, GParamSpec *pspec, gpointer 
 
 static void on_thresh_changed(GtkSpinButton *spin, gpointer user_data) {
     RouteEntry *entry = (RouteEntry *)user_data;
-    entry->threshold_db = gtk_spin_button_get_value(spin);
+    if (entry->active_worker) {
+        entry->active_worker->threshold_db = gtk_spin_button_get_value(spin);
+    }
 }
 
 static gboolean on_switch_state_set(GtkSwitch *sw, gboolean state, gpointer user_data) {
     RouteEntry *entry = (RouteEntry *)user_data;
 
     if (state) {
+        stop_entry(entry);
+
         guint in_idx = gtk_drop_down_get_selected(GTK_DROP_DOWN(entry->input_dd));
         guint in_p_idx = gtk_drop_down_get_selected(GTK_DROP_DOWN(entry->in_port_dd));
         guint out_idx = gtk_drop_down_get_selected(GTK_DROP_DOWN(entry->output_dd));
@@ -883,19 +946,32 @@ static gboolean on_switch_state_set(GtkSwitch *sw, gboolean state, gpointer user
         const char *src_port = g_ptr_array_index(entry->in_ports, in_p_idx);
         const char *snk_port = g_ptr_array_index(entry->out_ports, out_p_idx);
 
-        entry->source_name = g_strdup(src->name);
-        entry->source_port = g_strdup(src_port);
-        entry->sink_name = g_strdup(snk->name);
-        entry->sink_port = g_strdup(snk_port);
-        entry->threshold_db = gtk_spin_button_get_value(GTK_SPIN_BUTTON(entry->thresh_spin));
-        entry->running = true;
+        // Allocate atomically reference-counted WorkerContext (starts with refcount = 1 for entry)
+        WorkerContext *wctx = g_atomic_rc_box_new0(WorkerContext);
+        wctx->owner_entry = entry;
+        wctx->source_name = g_strdup(src->name);
+        wctx->source_port = g_strdup(src_port);
+        wctx->sink_name = g_strdup(snk->name);
+        wctx->sink_port = g_strdup(snk_port);
+        wctx->threshold_db = gtk_spin_button_get_value(GTK_SPIN_BUTTON(entry->thresh_spin));
+        g_atomic_int_set(&wctx->running, 1);
+
+        entry->active_worker = wctx;
 
         gtk_widget_set_sensitive(entry->input_dd, FALSE);
         gtk_widget_set_sensitive(entry->in_port_dd, FALSE);
         gtk_widget_set_sensitive(entry->output_dd, FALSE);
         gtk_widget_set_sensitive(entry->out_port_dd, FALSE);
 
-        pthread_create(&entry->thread, NULL, route_worker, entry);
+        // Acquire a second reference specifically for the worker thread
+        g_atomic_rc_box_acquire(wctx);
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, route_worker, wctx) == 0) {
+            pthread_detach(tid);
+        } else {
+            worker_context_unref(wctx); // Release thread ref on failure
+            stop_entry(entry);
+        }
     } else {
         stop_entry(entry);
         gtk_widget_set_sensitive(entry->input_dd, TRUE);
@@ -1044,14 +1120,11 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
 
     route_entries = g_ptr_array_new();
 
-    // Hold application so hiding or starting minimized never exits the main loop
     g_application_hold(G_APPLICATION(app));
 
-    // Handle SIGINT (Ctrl+C) and SIGTERM (killall) so links are always disconnected on exit
     g_unix_signal_add(SIGINT, on_unix_signal_quit, NULL);
     g_unix_signal_add(SIGTERM, on_unix_signal_quit, NULL);
 
-    // Register baked-in icon from app_icon.h for GTK4 and KDE System Tray
     register_baked_app_icon();
     setup_system_tray();
 
@@ -1164,16 +1237,13 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scrolled), list_box);
     gtk_box_append(GTK_BOX(main_vbox), scrolled);
 
-    // Quietly load existing config or create initial row and log it to disk
     if (!load_config_quietly()) {
         add_route_row(NULL, NULL, NULL, NULL, -40.0, false);
         sync_config_if_diff(true);
     }
 
-    // Schedule hourly background diff & config update (every 3600 seconds)
     g_timeout_add_seconds(CONFIG_SYNC_INTERVAL_SEC, hourly_config_sync_cb, NULL);
 
-    // Only present window on launch if "Start minimized" is off
     if (!opt_start_minimized) {
         gtk_window_present(GTK_WINDOW(main_window));
     }
